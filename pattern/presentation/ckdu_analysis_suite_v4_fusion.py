@@ -158,8 +158,10 @@ def load_ckdu_processed(csv_path: str) -> Dataset:
     feature_df = df.iloc[:, 1:].copy()
     feature_df = feature_df.apply(pd.to_numeric, errors="coerce")
 
-    # If dataset includes Age/S.cr after the label (>= 32 features), skip both.
-    # If it already contains metals only (exactly 30 features), use directly.
+    # Strict metals-only policy:
+    # - If layout is [Age, S.cr, 30 metals, ...], always drop Age/S.cr.
+    # - If layout is already 30 metals, use those directly.
+    # - Any ambiguous layout raises an error.
     n_features = feature_df.shape[1]
     if n_features == len(METAL_FEATURE_NAMES):
         metal_df = feature_df.iloc[:, :len(METAL_FEATURE_NAMES)].copy()
@@ -172,7 +174,13 @@ def load_ckdu_processed(csv_path: str) -> Dataset:
             "or at least 32 columns including Age/S.cr + 30 metals."
         )
 
-    metal_df.columns = METAL_FEATURE_NAMES[:metal_df.shape[1]]
+    if metal_df.shape[1] != len(METAL_FEATURE_NAMES):
+        raise ValueError(
+            f"Expected exactly {len(METAL_FEATURE_NAMES)} metal features after filtering, "
+            f"got {metal_df.shape[1]}."
+        )
+
+    metal_df.columns = METAL_FEATURE_NAMES
 
     X = metal_df.to_numpy(dtype=float)
     final_feature_names = list(metal_df.columns)
@@ -188,7 +196,7 @@ def _make_multinomial_logreg(class_weight=None) -> LogisticRegression:
     kwargs = dict(
         solver="lbfgs",
         max_iter=5000,
-        C=0.5,
+        C=0.8,
         tol=1e-4,
         random_state=RANDOM_STATE,
         class_weight=class_weight,
@@ -213,12 +221,12 @@ def _make_regularized_mlp(
         hidden_layer_sizes=hidden_layer_sizes,
         activation="relu",
         solver="adam",
-        alpha=1e-3,
+        alpha=3e-4,
         learning_rate_init=1e-3,
         learning_rate="adaptive",
         max_iter=max_iter,
         early_stopping=True,
-        validation_fraction=0.15,
+        validation_fraction=0.10,
         n_iter_no_change=n_iter_no_change,
         random_state=random_state,
     )
@@ -386,6 +394,82 @@ def _top_bar_plot(df: pd.DataFrame, value_col: str, title: str, outpath: str, to
     fig.tight_layout()
     fig.savefig(outpath, dpi=180)
     plt.close(fig)
+
+
+def _derive_frequency_consensus_features_from_outputs(
+        root_outdir: str,
+        feature_names: List[str],
+        top_k: int = 8,
+        source_top_n: int = 8,
+) -> Tuple[List[str], pd.DataFrame, pd.DataFrame]:
+    # Each source contributes its top-N features; consensus is by appearance frequency.
+    source_specs = [
+        ("pca_sep", "pca/pca_ckdu_separation_feature_scores.csv", "abs_score", False),
+        ("bayes_single", "bayes/bayes_single_feature_ranking.csv", "cv_f1_macro", False),
+        ("bayes_loo", "bayes/bayes_leave_one_out_importance.csv", "f1_drop_when_removed", False),
+        ("bayes_llr", "bayes/bayes_llr_feature_contributions.csv", "avg_abs_llr_vs_each_class", False),
+        ("fisher_coef", "fisher/fisher_lda_ckdu_coefficients.csv", "abs_coef", False),
+        ("skew_kurt_delta", "skew_kurt/skew_kurtosis_delta_ckdu_vs_rest.csv", "delta_norm", False),
+        ("signif_anova", "significance/significance_multiclass_anova_kruskal.csv", "anova_neglog10p", False),
+        ("signif_ttest", "significance/significance_ckdu_vs_rest_ttest_mwu.csv", "t_neglog10p", False),
+        ("logreg_ckdu", "regression/logreg_coefficients_ckdu.csv", "abs_coef", False),
+        ("ridge_ckdu", "regression/ridge_ckdu_vs_rest_coefficients.csv", "abs_w", False),
+        ("gmm_effect", "gmm/gmm_feature_effect_size_ckdu_vs_rest.csv", "abs_effect_size", False),
+        ("nn_perm", "nn/mlp_permutation_importance.csv", "perm_importance_mean", False),
+    ]
+
+    name_set = set(feature_names)
+    counts = {f: 0 for f in feature_names}
+    rank_sums = {f: 0.0 for f in feature_names}
+    hit_rows: List[Dict[str, object]] = []
+
+    for source_name, rel_path, score_col, ascending in source_specs:
+        path = os.path.join(root_outdir, rel_path)
+        if not os.path.exists(path):
+            continue
+        try:
+            df = pd.read_csv(path)
+        except Exception:
+            continue
+        if "feature" not in df.columns or score_col not in df.columns:
+            continue
+
+        source_df = df[["feature", score_col]].copy()
+        source_df["feature"] = source_df["feature"].astype(str)
+        source_df = source_df[source_df["feature"].isin(name_set)]
+        source_df = source_df.dropna(subset=[score_col])
+        if source_df.empty:
+            continue
+
+        source_df = source_df.sort_values(score_col, ascending=ascending).head(max(1, int(source_top_n)))
+        for rank, row in enumerate(source_df.itertuples(index=False), start=1):
+            feat = str(getattr(row, "feature"))
+            score = float(getattr(row, score_col))
+            counts[feat] += 1
+            rank_sums[feat] += float(rank)
+            hit_rows.append({
+                "source": source_name,
+                "feature": feat,
+                "rank_in_source": rank,
+                "source_score": score,
+            })
+
+    summary_df = pd.DataFrame({
+        "feature": feature_names,
+        "appearance_count": [counts[f] for f in feature_names],
+        "avg_rank_if_hit": [
+            (rank_sums[f] / counts[f]) if counts[f] > 0 else np.nan
+            for f in feature_names
+        ],
+        "legacy_alias": [REVERSE_F_ALIAS_MAP.get(f, "") for f in feature_names],
+    }).sort_values(
+        ["appearance_count", "avg_rank_if_hit", "feature"],
+        ascending=[False, True, True],
+    ).reset_index(drop=True)
+
+    selected = summary_df.loc[summary_df["appearance_count"] > 0, "feature"].head(max(1, int(top_k))).tolist()
+    hits_df = pd.DataFrame(hit_rows)
+    return selected, summary_df, hits_df
 
     # =====================
     # 1) PCA-based analysis
@@ -573,14 +657,15 @@ def analysis_fisher(ds: Dataset, outdir: str, n_splits: int = 5):
     y_pred_oof = np.zeros_like(y)
     pipe = Pipeline([
         ("scaler", StandardScaler()),
-        ("lda", _make_regularized_lda()),
+        ("lda", LinearDiscriminantAnalysis(solver="svd")),
     ])
     for tr, te in skf.split(X, y):
         pipe.fit(X[tr], y[tr])
         y_pred_oof[te] = pipe.predict(X[te])
 
     metrics = _basic_metrics(y, y_pred_oof)
-    _save_json(metrics, os.path.join(outdir, "fisher_lda_cv_metrics.json"))
+    with open(os.path.join(outdir, "fisher_lda_cv_metrics.json"), "w") as f:
+        json.dump(metrics, f, indent=2)
 
     _save_confusion(
         y_true=y,
@@ -593,6 +678,7 @@ def analysis_fisher(ds: Dataset, outdir: str, n_splits: int = 5):
     print("\n[Fisher/LDA] CV metrics:")
     print(json.dumps(metrics, indent=2))
 
+    # Fit once on all data for interpretability (one-vs-rest decision functions)
     pipe.fit(X, y)
     lda: LinearDiscriminantAnalysis = pipe.named_steps["lda"]
     coef = getattr(lda, "coef_", None)
@@ -606,6 +692,8 @@ def analysis_fisher(ds: Dataset, outdir: str, n_splits: int = 5):
             "abs_coef": np.abs(ckdu_coef),
         }).sort_values("abs_coef", ascending=False)
         coef_df.to_csv(os.path.join(outdir, "fisher_lda_ckdu_coefficients.csv"), index=False)
+        print("\n[Fisher/LDA] Top features by |LDA coef| for CKDu (one-vs-rest):")
+        print(coef_df.head(12).to_string(index=False))
 
     try:
         scaler: StandardScaler = pipe.named_steps["scaler"]
@@ -796,7 +884,7 @@ def analysis_regression(ds: Dataset, outdir: str, test_size: float = 0.25):
         )
         ridge = Pipeline([
             ("scaler", StandardScaler()),
-            ("reg", Ridge(alpha=2.0, random_state=RANDOM_STATE)),
+            ("reg", Ridge(alpha=1.2, random_state=RANDOM_STATE)),
         ])
         ridge.fit(Xtr, ytr)
         yscore = ridge.predict(Xte)
@@ -848,7 +936,7 @@ def analysis_gmm(ds: Dataset, outdir: str, n_components_max: int = 3, test_size:
                 covariance_type="diag",
                 random_state=RANDOM_STATE,
                 n_init=3,
-                reg_covar=1e-4,
+                reg_covar=3e-5,
             )
             gmm.fit(Xc)
             bic = gmm.bic(Xc)
@@ -1203,7 +1291,7 @@ def _feature_selection_consensus(
     else:
         ckdu_score = np.zeros(X_proc.shape[1])
 
-    lda = _make_regularized_lda(priors=_uniform_priors(np.unique(y)))
+    lda = LinearDiscriminantAnalysis(solver="svd")
     lda.fit(X_proc, y)
     if 1 in lda.classes_ and hasattr(lda, "coef_"):
         lda_coef = np.abs(lda.coef_[np.where(lda.classes_ == 1)[0][0]])
@@ -1257,6 +1345,7 @@ class PCAGuidedFusionClassifier(BaseEstimator, ClassifierMixin):
             base_weights: Optional[List[float]] = None,
             mlp_hidden: Tuple[int, int] = (24, 12),
             feature_names: Optional[List[str]] = None,
+            forced_raw_features: Optional[List[str]] = None,
     ):
         self.preproc_kind = preproc_kind
         self.pca_variance_threshold = pca_variance_threshold
@@ -1267,6 +1356,7 @@ class PCAGuidedFusionClassifier(BaseEstimator, ClassifierMixin):
         self.base_weights = base_weights
         self.mlp_hidden = mlp_hidden
         self.feature_names = feature_names
+        self.forced_raw_features = forced_raw_features
 
     def _build_representation(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         X_proc = self.pre_.transform(X)
@@ -1290,7 +1380,7 @@ class PCAGuidedFusionClassifier(BaseEstimator, ClassifierMixin):
         classes = np.sort(np.unique(y))
 
         for tr, te in skf.split(X_fused, y):
-            lda = _make_regularized_lda(priors=_uniform_priors(classes))
+            lda = LinearDiscriminantAnalysis(solver="svd")
             lda.fit(X_pca[tr], y[tr])
             score_map["lda"].append(f1_score(y[te], lda.predict(X_pca[te]), average="macro"))
 
@@ -1333,9 +1423,22 @@ class PCAGuidedFusionClassifier(BaseEstimator, ClassifierMixin):
             feature_names=self.feature_names_in_,
             raw_top_k=self.raw_top_k,
         )
-        selected = self.selector_table_.loc[
-            self.selector_table_["selected_for_raw_branch"] == 1, "feature"].tolist()
         name_to_idx = {n: i for i, n in enumerate(self.feature_names_in_)}
+        if self.forced_raw_features:
+            forced = resolve_feature_names(
+                [s for s in self.forced_raw_features if str(s).strip()],
+                self.feature_names_in_,
+            )
+            # Keep order, remove duplicates.
+            selected = list(dict.fromkeys(forced))
+            self.selector_table_["selected_for_raw_branch"] = 0
+            self.selector_table_.loc[
+                self.selector_table_["feature"].isin(selected), "selected_for_raw_branch"
+            ] = 1
+        else:
+            selected = self.selector_table_.loc[
+                self.selector_table_["selected_for_raw_branch"] == 1, "feature"
+            ].tolist()
         self.selected_raw_features_ = selected
         self.selected_raw_idx_ = np.array([name_to_idx[f] for f in selected],
                                           dtype=int) if selected else np.array([], dtype=int)
@@ -1354,7 +1457,7 @@ class PCAGuidedFusionClassifier(BaseEstimator, ClassifierMixin):
         else:
             X_fused = X_pca.copy()
 
-        self.lda_ = _make_regularized_lda(priors=_uniform_priors(self.classes_))
+        self.lda_ = LinearDiscriminantAnalysis(solver="svd")
         self.lda_.fit(X_pca, y)
 
         self.logreg_ = _make_multinomial_logreg(class_weight="balanced")
@@ -1446,6 +1549,7 @@ def analysis_fusion(
         pca_variance_threshold: float = 0.95,
         max_pca_components: int = 12,
         raw_top_k: int = 8,
+        forced_raw_features: Optional[List[str]] = None,
         shap_background: int = 40,
         shap_samples: int = 20,
         lime_samples: int = 5,
@@ -1473,6 +1577,7 @@ def analysis_fusion(
             pca_variance_threshold=pca_variance_threshold,
             max_pca_components=max_pca_components,
             raw_top_k=raw_top_k,
+            forced_raw_features=forced_raw_features,
             internal_cv=3,
             random_state=RANDOM_STATE + fold,
             feature_names=ds.feature_names,
@@ -1549,6 +1654,7 @@ def analysis_fusion(
         pca_variance_threshold=pca_variance_threshold,
         max_pca_components=max_pca_components,
         raw_top_k=raw_top_k,
+        forced_raw_features=forced_raw_features,
         internal_cv=3,
         random_state=RANDOM_STATE,
         feature_names=ds.feature_names,
@@ -1563,6 +1669,7 @@ def analysis_fusion(
             "selected_raw_features": final_model.selected_raw_features_,
             "selected_raw_features_alias": [REVERSE_F_ALIAS_MAP.get(f, "") for f in
                                             final_model.selected_raw_features_],
+            "forced_raw_features": forced_raw_features if forced_raw_features else [],
             "n_pca_components": int(final_model.n_pca_components_),
             "pca_variance_threshold": pca_variance_threshold,
             "model_weights": final_model.model_weight_dict_,
@@ -1702,10 +1809,41 @@ def analysis_all(ds: Dataset, outdir: str, args):
     analysis_regression(ds, os.path.join(root, "regression"))
     analysis_gmm(ds, os.path.join(root, "gmm"))
     analysis_nn(ds, os.path.join(root, "nn"))
+
+    consensus_top, consensus_summary_df, consensus_hits_df = _derive_frequency_consensus_features_from_outputs(
+        root_outdir=root,
+        feature_names=ds.feature_names,
+        top_k=args.consensus_top_k,
+        source_top_n=args.consensus_source_top_n,
+    )
+    if consensus_top:
+        selected_top_features = consensus_top
+        selection_mode = "frequency_consensus_from_previous_analyses"
+    else:
+        selected_top_features = [s.strip() for s in args.top_features.split(",") if s.strip()]
+        selected_top_features = resolve_feature_names(selected_top_features, ds.feature_names)
+        selection_mode = "fallback_manual_top_features"
+
+    consensus_summary_df.to_csv(os.path.join(root, "consensus_feature_frequency_summary.csv"), index=False)
+    if not consensus_hits_df.empty:
+        consensus_hits_df.to_csv(os.path.join(root, "consensus_feature_frequency_hits.csv"), index=False)
+    _save_json(
+        {
+            "selection_mode": selection_mode,
+            "consensus_top_features": selected_top_features,
+            "consensus_top_features_alias": [REVERSE_F_ALIAS_MAP.get(f, "") for f in selected_top_features],
+            "consensus_top_k": int(args.consensus_top_k),
+            "consensus_source_top_n": int(args.consensus_source_top_n),
+        },
+        os.path.join(root, "consensus_feature_selection.json"),
+    )
+    print("\n[All] Consensus top features from previous analyses:")
+    print(selected_top_features)
+
     analysis_validate_top_features(
         ds,
         outdir=os.path.join(root, "validate_top8"),
-        top_features=[s.strip() for s in args.top_features.split(",") if s.strip()],
+        top_features=selected_top_features,
         preproc_kind=args.preproc,
         n_splits=args.cv_splits,
         perm_repeats=args.perm_repeats,
@@ -1717,7 +1855,8 @@ def analysis_all(ds: Dataset, outdir: str, args):
         preproc_kind=args.preproc,
         pca_variance_threshold=args.fusion_pca_var,
         max_pca_components=args.fusion_max_pca,
-        raw_top_k=args.fusion_raw_top_k,
+        raw_top_k=max(args.fusion_raw_top_k, len(selected_top_features)),
+        forced_raw_features=selected_top_features,
         shap_background=args.shap_background,
         shap_samples=args.shap_samples,
         lime_samples=args.lime_samples,
@@ -1766,6 +1905,18 @@ def main():
     )
     ap.add_argument("--cv_splits", type=int, default=5, help="Number of CV folds")
     ap.add_argument("--perm_repeats", type=int, default=10, help="Permutation repeats")
+    ap.add_argument(
+        "--consensus_top_k",
+        type=int,
+        default=8,
+        help="When --analysis all: number of frequency-consensus features to use for validate_top8 and fusion",
+    )
+    ap.add_argument(
+        "--consensus_source_top_n",
+        type=int,
+        default=8,
+        help="When --analysis all: top-N features taken from each prior analysis output for consensus counting",
+    )
 
     ap.add_argument("--fusion_raw_top_k", type=int, default=8,
                     help="Number of raw features in the fusion side-branch")
